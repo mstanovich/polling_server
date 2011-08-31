@@ -130,6 +130,20 @@ static inline ktime_t timeval_to_ktime(struct timeval tv)
 /* Convert ktime_t to nanoseconds - NOP in the scalar storage format: */
 #define ktime_to_ns(kt)			((kt).tv64)
 
+/**
+ * Returns:
+ * 	-1: lhs < rhs
+ * 	 0: equal
+ * 	 1: lhs > rhs
+ */
+static inline int ktime_cmp(ktime_t lhs, ktime_t rhs)
+{
+	if (lhs.tv64 < rhs.tv64) return -1;
+	if (lhs.tv64 > rhs.tv64) return 1;
+	
+	return 0;
+}
+
 #else	/* !((BITS_PER_LONG == 64) || defined(CONFIG_KTIME_SCALAR)) */
 
 /*
@@ -273,6 +287,24 @@ static inline struct timeval ktime_to_timeval(const ktime_t kt)
 static inline s64 ktime_to_ns(const ktime_t kt)
 {
 	return (s64) kt.tv.sec * NSEC_PER_SEC + kt.tv.nsec;
+}
+
+/**
+ *
+ * Returns:
+ * 	-1: lhs < rhs
+ * 	 0: equal
+ * 	 1: lhs > rhs
+ */
+static inline int ktime_cmp(ktime_t lhs, ktime_t rhs)
+{
+	if (lhs.tv.sec < rhs.tv.sec) return -1;
+	if (lhs.tv.sec > rhs.tv.sec) return 1;
+
+	if (lhs.tv.nsec < rhs.tv.nsec) return -1;
+	if (lhs.tv.nsec > rhs.tv_nsec) return 1;
+
+	return 0;
 }
 
 #endif	/* !((BITS_PER_LONG == 64) || defined(CONFIG_KTIME_SCALAR)) */
