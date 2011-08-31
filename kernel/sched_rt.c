@@ -1101,6 +1101,16 @@ static void check_preempt_curr_rt(struct rq *rq, struct task_struct *p, int flag
 #endif
 }
 
+static enum hrtimer_restart ss_repl_cb(struct hrtimer *timer)
+{
+	return HRTIMER_NORESTART;
+}
+
+static enum hrtimer_restart ss_exh_cb(struct hrtimer *timer)
+{
+	return HRTIMER_NORESTART;
+}
+
 static struct sched_rt_entity *pick_next_rt_entity(struct rq *rq,
 						   struct rt_rq *rt_rq)
 {

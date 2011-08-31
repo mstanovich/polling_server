@@ -124,7 +124,7 @@
 
 static inline int rt_policy(int policy)
 {
-	if (unlikely(policy == SCHED_FIFO || policy == SCHED_RR))
+	if (unlikely(policy == SCHED_FIFO || policy == SCHED_RR || policy == SCHED_SPORADIC))
 		return 1;
 	return 0;
 }
@@ -2839,7 +2839,7 @@ void sched_fork(struct task_struct *p)
 	 * Revert to default priority/policy on fork if requested.
 	 */
 	if (unlikely(p->sched_reset_on_fork)) {
-		if (p->policy == SCHED_FIFO || p->policy == SCHED_RR) {
+		if (p->policy == SCHED_FIFO || p->policy == SCHED_RR || p->policy == SCHED_SPORADIC) {
 			p->policy = SCHED_NORMAL;
 			p->normal_prio = p->static_prio;
 		}
@@ -4894,7 +4894,7 @@ void set_user_nice(struct task_struct *p, long nice)
 	 * The RT priorities are set via sched_setscheduler(), but we still
 	 * allow the 'normal' nice value to be set - but as expected
 	 * it wont have any effect on scheduling until the task is
-	 * SCHED_FIFO/SCHED_RR:
+	 * SCHED_FIFO/SCHED_RR/SCHED_SPORADIC:
 	 */
 	if (task_has_rt_policy(p)) {
 		p->static_prio = NICE_TO_PRIO(nice);
@@ -5085,14 +5085,14 @@ recheck:
 		reset_on_fork = !!(policy & SCHED_RESET_ON_FORK);
 		policy &= ~SCHED_RESET_ON_FORK;
 
-		if (policy != SCHED_FIFO && policy != SCHED_RR &&
+		if (policy != SCHED_FIFO && policy != SCHED_RR && policy != SCHED_SPORADIC &&
 				policy != SCHED_NORMAL && policy != SCHED_BATCH &&
 				policy != SCHED_IDLE)
 			return -EINVAL;
 	}
 
 	/*
-	 * Valid priorities for SCHED_FIFO and SCHED_RR are
+	 * Valid priorities for SCHED_FIFO, SCHED_RR, and SCHED_SPORADIC are
 	 * 1..MAX_USER_RT_PRIO-1, valid priority for SCHED_NORMAL,
 	 * SCHED_BATCH and SCHED_IDLE is 0.
 	 */
@@ -5100,6 +5100,23 @@ recheck:
 	    (p->mm && param->sched_priority > MAX_USER_RT_PRIO-1) ||
 	    (!p->mm && param->sched_priority > MAX_RT_PRIO-1))
 		return -EINVAL;
+
+	/*
+	 * SCHED_SPORADIC also has a low priority value.  Ensure that the low
+	 * priority value is a valid priority.
+	 */
+	if (policy == SCHED_SPORADIC &&
+	    ((p->mm && param->sched_ss_low_priority > MAX_USER_RT_PRIO-1) ||
+	    (!p->mm && param->sched_ss_low_priority > MAX_RT_PRIO-1)))
+		return -EINVAL;
+	if (policy == SCHED_SPORADIC && param->sched_ss_low_priority < 1)
+		return -EINVAL;
+
+	if (policy == SCHED_SPORADIC && param->sched_ss_max_repl > SS_REPL_MAX)
+		return -EINVAL;
+
+	/* real-time priority must be > 0, non-real-time priority must be 0 */
+
 	if (rt_policy(policy) != (param->sched_priority != 0))
 		return -EINVAL;
 
@@ -5162,6 +5179,11 @@ recheck:
 		return -EINVAL;
 	}
 
+/*
+ * TODO: When adding SCHED_SPORADIC, more in depth check needed to
+ * determine if no scheduling parameters are changed.
+ */
+#if 0
 	/*
 	 * If not changing anything there's no need to proceed further:
 	 */
@@ -5172,6 +5194,7 @@ recheck:
 		raw_spin_unlock_irqrestore(&p->pi_lock, flags);
 		return 0;
 	}
+#endif
 
 #ifdef CONFIG_RT_GROUP_SCHED
 	if (user) {
@@ -5207,11 +5230,41 @@ recheck:
 	prev_class = p->sched_class;
 	__setscheduler(rq, p, policy, param->sched_priority);
 
+	/* Initialization of SCHED_SPORADIC task parameters */
+	if (policy == SCHED_SPORADIC) {
+		/* when first starting, rt_priority will be the fg priority, which is
+		 * is set above through __setscheduler(). */
+
+		/* set scheduling parameters */
+		p->rt_priority = param->sched_priority;
+		/* put priority into kernel's representation */
+		p->sched_ss_low_priority = MAX_RT_PRIO-1 - param->sched_ss_low_priority;
+		p->sched_ss_repl_period = timespec_to_ktime(param->sched_ss_repl_period);
+		p->sched_ss_init_budget = timespec_to_ktime(param->sched_ss_init_budget);
+		p->sched_ss_max_repl = param->sched_ss_max_repl;
+
+		/* initialize timers */
+		hrtimer_init(&p->ss_repl_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
+		p->ss_repl_timer.function = ss_repl_cb;
+
+		hrtimer_init(&p->ss_exh_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
+		p->ss_exh_timer.function = ss_exh_cb;
+
+		/* initialize ss_repl_list */
+		p->ss_repl_list[0].amt = ns_to_ktime(0);
+		p->ss_repl_list[0].time = hrtimer_cb_get_time(&p->ss_repl_timer);
+		p->repl_head = -1;
+	}
+
 	if (running)
 		p->sched_class->set_curr_task(rq);
 	if (on_rq)
 		activate_task(rq, p, 0);
 
+	/* 
+	 * notifies scheduler class about policy/priority changes (i.e calls
+	 * switched_from, prio_changed)
+	 */
 	check_class_changed(rq, p, prev_class, oldprio);
 	task_rq_unlock(rq, p, &flags);
 
@@ -5350,6 +5403,18 @@ SYSCALL_DEFINE2(sched_getparam, pid_t, pid, struct sched_param __user *, param)
 		goto out_unlock;
 
 	lp.sched_priority = p->rt_priority;
+
+	/* if scheduling policy (p->policy) is SCHED_SPORADIC, set other
+	 * members of returning struct sched_param */
+	if (p->policy == SCHED_SPORADIC) {
+		lp.sched_priority = p->rt_priority;
+		/* p->sched_ss_low_priority is in kernel representation, convert to user representation */
+		lp.sched_ss_low_priority = MAX_RT_PRIO-1 - p->sched_ss_low_priority;
+		lp.sched_ss_repl_period = ktime_to_timespec(p->sched_ss_repl_period);
+		lp.sched_ss_init_budget = ktime_to_timespec(p->sched_ss_init_budget);
+		lp.sched_ss_max_repl = p->sched_ss_max_repl;
+	}
+
 	rcu_read_unlock();
 
 	/*
@@ -5737,6 +5802,7 @@ SYSCALL_DEFINE1(sched_get_priority_max, int, policy)
 	switch (policy) {
 	case SCHED_FIFO:
 	case SCHED_RR:
+	case SCHED_SPORADIC:
 		ret = MAX_USER_RT_PRIO-1;
 		break;
 	case SCHED_NORMAL:
@@ -5762,6 +5828,7 @@ SYSCALL_DEFINE1(sched_get_priority_min, int, policy)
 	switch (policy) {
 	case SCHED_FIFO:
 	case SCHED_RR:
+	case SCHED_SPORADIC:
 		ret = 1;
 		break;
 	case SCHED_NORMAL:
