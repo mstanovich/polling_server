@@ -5235,6 +5235,7 @@ recheck:
 	if (policy == SCHED_SPORADIC) {
 		/* when first starting, rt_priority will be the fg priority, which is
 		 * is set above through __setscheduler(). */
+		ktime_t now;
 
 		/* set scheduling parameters */
 		p->rt_priority = param->sched_priority;
@@ -5255,6 +5256,14 @@ recheck:
 		p->ss_repl_list[0].amt = ns_to_ktime(0);
 		p->ss_repl_list[0].time = hrtimer_cb_get_time(&p->ss_repl_timer);
 		p->repl_head = -1;
+
+		/*
+		 * Set the start time of the first period.
+		 * fg execution will begin start of second period.
+		 * Timer is NOT activated here.
+		 */
+		now = hrtimer_cb_get_time(&p->ss_repl_timer);
+		hrtimer_set_expires(&p->ss_repl_timer, now);
 	}
 
 	if (running)

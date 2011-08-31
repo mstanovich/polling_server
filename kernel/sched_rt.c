@@ -702,9 +702,10 @@ static void update_curr_rt(struct rq *rq)
 
 	sched_rt_avg_update(rq, delta_exec);
 
-	if (curr->policy == SCHED_SPORADIC && curr->prio == curr->rt_priority) {
-		/* ss usage is only if we are consuming fg priority time.  That is, the
-		 * priority is rt_priority (fg priority) */
+	if (curr->policy == SCHED_SPORADIC && ss_curr_prio_fg(curr)) {
+		/* ss usage is updated only if we are consuming fg priority
+		 * time.  That is, the priority is rt_priority (fg
+		 * priority) */
 		curr->ss_usage = ktime_add_ns(curr->ss_usage, delta_exec);
 	}
 
@@ -1031,10 +1032,11 @@ enqueue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 		enqueue_pushable_task(rq, p);
 
 	if (p->policy == SCHED_SPORADIC) {
-		int tmr_active = hrtimer_start(&p->ss_repl_timer,
-			p->sched_ss_repl_period, HRTIMER_MODE_REL);
-
-		WARN_ON(tmr_active);
+		/* forward the expiration time in interval(polling) increments */
+		hrtimer_forward(&p->ss_repl_timer,
+			hrtimer_get_expires(&p->ss_repl_timer), p->sched_ss_repl_period);
+		/* activate the timer */
+		hrtimer_restart(&p->ss_repl_timer);
 	}
 }
 
@@ -1049,18 +1051,15 @@ static void dequeue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 
 
 	if (p->policy == SCHED_SPORADIC) {
-		/* can't use hrtimer_cancel here because we are holding rq->lock */
-		/* TODO: need to verify/fix canceling timer correctly */
-		/* 
-		 * when setting priority/policy, task will be dequeued even though it
-		 * is not running?  If so, timer should not be active
-		 */
-		if (p->on_rq) {
-			/* -1 timer is currently executing and cannot be stopped */
-			WARN_ON(hrtimer_try_to_cancel(&p->ss_repl_timer) == -1);
-		} else {
-			WARN_ON(hrtimer_active(&p->ss_repl_timer));
-		}
+		/* TODO: need to verify/fix actually canceling timer (correctly) and if
+		 * it is not canceled ensure that it will be canceled properly once the
+		 * timer completes */
+		hrtimer_try_to_cancel(&p->ss_exh_timer);
+
+		/* replenishment timer should only be deactivated by a dequeue, so make
+		 * sure it is active before we cancel it */
+		WARN_ON(!hrtimer_active(&p->ss_repl_timer));
+		hrtimer_try_to_cancel(&p->ss_repl_timer);
 	}
 }
 
@@ -1209,7 +1208,9 @@ static enum hrtimer_restart ss_repl_cb(struct hrtimer *timer)
 	struct task_struct *p;
 	struct rq *rq;
 	bool blocked;
-	int new_prio;
+	int periods_passed;
+	ktime_t now;
+
 
 	p = container_of(timer, struct task_struct, ss_repl_timer);
 	rq = task_rq(p);
@@ -1221,18 +1222,25 @@ static enum hrtimer_restart ss_repl_cb(struct hrtimer *timer)
 
 	blocked = !p->on_rq;
 
-	if (ss_curr_prio_fg(p))
-		new_prio = ss_bg_prio(p);
-	else
-		new_prio = ss_fg_prio(p);
+	periods_passed = hrtimer_forward(timer, hrtimer_get_expires(timer), p->sched_ss_repl_period);
+	/* handles skipped periods */
+	now = ktime_sub(hrtimer_get_expires(timer), p->sched_ss_repl_period);
 
-	if (!ss_fg_prio(p) && !ss_bg_prio(p))
-		printk(KERN_ERR "SCHED_SPORADIC: p->prio not at low or high prio!\n");
+	if (ktime_cmp(now, ns_to_ktime(0)) == -1)
+		printk(KERN_ERR "SCHED_SPORADIC: negative now\n");
 
-	ss_change_prio(rq, p, new_prio, blocked);
+	if (periods_passed != 1)
+		printk(KERN_ERR "SCHED_SPORADIC: replenishment timer skipped a period\n");
 
-	hrtimer_forward_now(timer, p->sched_ss_repl_period);
+	WARN_ON(hrtimer_active(&p->ss_exh_timer));
 
+	if (!blocked) {
+		hrtimer_start(&p->ss_exh_timer,
+			ktime_add(now, p->sched_ss_init_budget), HRTIMER_MODE_ABS);
+
+		ss_change_prio(rq, p, ss_fg_prio(p), blocked);
+	}
+ 
 	raw_spin_unlock(&rq->lock);
 
 	return HRTIMER_RESTART;
@@ -1240,6 +1248,26 @@ static enum hrtimer_restart ss_repl_cb(struct hrtimer *timer)
 
 static enum hrtimer_restart ss_exh_cb(struct hrtimer *timer)
 {
+	struct task_struct *p;
+	struct rq *rq;
+	bool blocked;
+
+	p = container_of(timer, struct task_struct, ss_exh_timer);
+	rq = task_rq(p);
+	
+	raw_spin_lock(&rq->lock);
+
+	blocked = !p->on_rq;
+
+	ss_change_prio(rq, p, ss_bg_prio(p), blocked);
+	/* 
+	 * Remove task from rt rq data structure => cannot be picked.
+	 * Put task back on rq when replenishment arrives.
+	 */ 
+	dequeue_rt_stack(&p->rt);
+
+	raw_spin_unlock(&rq->lock);
+
 	return HRTIMER_NORESTART;
 }
 
