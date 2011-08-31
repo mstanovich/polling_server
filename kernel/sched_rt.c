@@ -3,6 +3,32 @@
  * policies)
  */
 
+static inline int ss_fg_prio(struct task_struct *p)
+{
+	return MAX_RT_PRIO-1 - p->rt_priority;
+}
+
+static inline int ss_bg_prio(struct task_struct *p)
+{
+	return p->sched_ss_low_priority;
+}
+
+static inline bool ss_curr_prio_fg(struct task_struct *p)
+{
+	if (p->normal_prio == ss_fg_prio(p))
+		return true;
+
+	return false;
+}
+
+static inline bool ss_curr_prio_bg(struct task_struct *p)
+{
+	if (p->normal_prio == ss_bg_prio(p))
+		return true;
+
+	return false;
+}
+
 #ifdef CONFIG_RT_GROUP_SCHED
 
 #define rt_entity_is_task(rt_se) (!(rt_se)->my_q)
@@ -640,6 +666,14 @@ static int sched_rt_runtime_exceeded(struct rt_rq *rt_rq)
 	return 0;
 }
 
+/**
+ * A context switch is about to occur.
+ */
+static void cs_notify_rt(struct rq *rq, struct task_struct *prev,
+              struct task_struct *next)
+{
+}
+
 /*
  * Update the current task's runtime statistics. Skip current tasks that
  * are not in our scheduling class.
@@ -667,6 +701,12 @@ static void update_curr_rt(struct rq *rq)
 	cpuacct_charge(curr, delta_exec);
 
 	sched_rt_avg_update(rq, delta_exec);
+
+	if (curr->policy == SCHED_SPORADIC && curr->prio == curr->rt_priority) {
+		/* ss usage is only if we are consuming fg priority time.  That is, the
+		 * priority is rt_priority (fg priority) */
+		curr->ss_usage = ktime_add_ns(curr->ss_usage, delta_exec);
+	}
 
 	if (!rt_bandwidth_enabled())
 		return;
@@ -934,6 +974,46 @@ static void dequeue_rt_entity(struct sched_rt_entity *rt_se)
 	}
 }
 
+static void
+prio_changed_rt(struct rq *rq, struct task_struct *p, int oldprio);
+/**
+ * Similar to __setscheduler().
+ */
+static void ss_change_prio(struct rq *rq, struct task_struct *p,
+	int new_prio, bool blocked)
+{
+	struct sched_rt_entity *rt_se = &p->rt;
+	unsigned long flags;
+	int oldprio = p->prio;
+
+	if (!blocked) {
+		dequeue_rt_stack(rt_se);
+	}
+	
+	p->normal_prio = new_prio;
+	raw_spin_lock_irqsave(&p->pi_lock, flags);
+	p->prio = rt_mutex_getprio(p);
+	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+
+	/* 
+	 * minimal dequeue/enqueue to set bit in priority array and change
+	 * location in rt queue.
+	 * Changing location in rt queue only should be done if we are currently
+	 * enqueued.
+	 */
+	if (!blocked) {
+		/* do not want to enqueue rt_se if it was not previously */
+		for_each_sched_rt_entity(rt_se) {
+				__enqueue_rt_entity(rt_se, true);
+		}
+		/* 
+		 * calls resched_task() if necessary.  Could possibly reschedule only
+		 * if p is runnable.
+		 */
+		prio_changed_rt(rq, p, oldprio);
+	}
+}
+
 /*
  * Adding/removing a task to/from a priority array:
  */
@@ -949,6 +1029,13 @@ enqueue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 
 	if (!task_current(rq, p) && p->rt.nr_cpus_allowed > 1)
 		enqueue_pushable_task(rq, p);
+
+	if (p->policy == SCHED_SPORADIC) {
+		int tmr_active = hrtimer_start(&p->ss_repl_timer,
+			p->sched_ss_repl_period, HRTIMER_MODE_REL);
+
+		WARN_ON(tmr_active);
+	}
 }
 
 static void dequeue_task_rt(struct rq *rq, struct task_struct *p, int flags)
@@ -959,6 +1046,22 @@ static void dequeue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 	dequeue_rt_entity(rt_se);
 
 	dequeue_pushable_task(rq, p);
+
+
+	if (p->policy == SCHED_SPORADIC) {
+		/* can't use hrtimer_cancel here because we are holding rq->lock */
+		/* TODO: need to verify/fix canceling timer correctly */
+		/* 
+		 * when setting priority/policy, task will be dequeued even though it
+		 * is not running?  If so, timer should not be active
+		 */
+		if (p->on_rq) {
+			/* -1 timer is currently executing and cannot be stopped */
+			WARN_ON(hrtimer_try_to_cancel(&p->ss_repl_timer) == -1);
+		} else {
+			WARN_ON(hrtimer_active(&p->ss_repl_timer));
+		}
+	}
 }
 
 /*
@@ -1103,7 +1206,36 @@ static void check_preempt_curr_rt(struct rq *rq, struct task_struct *p, int flag
 
 static enum hrtimer_restart ss_repl_cb(struct hrtimer *timer)
 {
-	return HRTIMER_NORESTART;
+	struct task_struct *p;
+	struct rq *rq;
+	bool blocked;
+	int new_prio;
+
+	p = container_of(timer, struct task_struct, ss_repl_timer);
+	rq = task_rq(p);
+	
+	raw_spin_lock(&rq->lock);
+
+	update_rq_clock(rq);
+	update_curr_rt(rq);
+
+	blocked = !p->on_rq;
+
+	if (ss_curr_prio_fg(p))
+		new_prio = ss_bg_prio(p);
+	else
+		new_prio = ss_fg_prio(p);
+
+	if (!ss_fg_prio(p) && !ss_bg_prio(p))
+		printk(KERN_ERR "SCHED_SPORADIC: p->prio not at low or high prio!\n");
+
+	ss_change_prio(rq, p, new_prio, blocked);
+
+	hrtimer_forward_now(timer, p->sched_ss_repl_period);
+
+	raw_spin_unlock(&rq->lock);
+
+	return HRTIMER_RESTART;
 }
 
 static enum hrtimer_restart ss_exh_cb(struct hrtimer *timer)
@@ -1169,6 +1301,13 @@ static struct task_struct *pick_next_task_rt(struct rq *rq)
 	 */
 	rq->post_schedule = has_pushable_tasks(rq);
 #endif
+
+/* Careful, p may be NULL meaning no tasks to execute */
+/*
+	if (p && p->policy == SCHED_SPORADIC) {
+		printk(KERN_ERR "picked SCHED_SPORADIC\n");
+	}
+*/
 
 	return p;
 }

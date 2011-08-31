@@ -4314,6 +4314,7 @@ need_resched:
 		rq->curr = next;
 		++*switch_count;
 
+		cs_notify_rt(rq, prev, next);
 		context_switch(rq, prev, next); /* unlocks the rq */
 		/*
 		 * The context switch have flipped the stack from under us
