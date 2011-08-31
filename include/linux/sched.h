@@ -39,14 +39,17 @@
 #define SCHED_BATCH		3
 /* SCHED_ISO: reserved but not implemented yet */
 #define SCHED_IDLE		5
+#define SCHED_SPORADIC	6
 /* Can be ORed in to make sure the process is reverted back to SCHED_NORMAL on fork */
 #define SCHED_RESET_ON_FORK     0x40000000
 
+/*
+ * SCHED_SPORADIC policy constants
+ */
+/* TODO: allow to be set in .config */
+#define SS_REPL_MAX 100
+ 
 #ifdef __KERNEL__
-
-struct sched_param {
-	int sched_priority;
-};
 
 #include <asm/param.h>	/* for HZ */
 
@@ -92,6 +95,19 @@ struct sched_param {
 #include <linux/cred.h>
 
 #include <asm/processor.h>
+
+struct sched_param {
+	int sched_priority;
+	int sched_ss_low_priority;
+	struct timespec sched_ss_repl_period;
+	struct timespec sched_ss_init_budget;
+	int sched_ss_max_repl;
+};
+
+struct sched_ss_repl {
+	ktime_t amt;
+	ktime_t time;
+};
 
 struct exec_domain;
 struct futex_pi_state;
@@ -1232,6 +1248,26 @@ struct task_struct {
 
 	int prio, static_prio, normal_prio;
 	unsigned int rt_priority;
+
+	/* SCHED_SPORADIC scheduling parameters */
+	/* TODO: really should be placed in struct sched_rt_entity,
+	 * but do not want to deal with group scheduling, etc. now */
+
+	/* fg (high) priority is the same as rt_priority.  rt_priority is only
+	 * changed by the user and is not affected by priority inheritance, etc. */
+	int sched_ss_low_priority;
+	ktime_t sched_ss_repl_period;
+	ktime_t sched_ss_init_budget;
+	int sched_ss_max_repl;
+
+	struct sched_ss_repl ss_repl_list[SS_REPL_MAX];
+	int repl_head;
+	ktime_t ss_usage;
+
+	/* SCHED_SPORADIC timers */
+	struct hrtimer ss_repl_timer;
+	struct hrtimer ss_exh_timer;
+
 	const struct sched_class *sched_class;
 	struct sched_entity se;
 	struct sched_rt_entity rt;
