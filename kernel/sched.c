@@ -5253,9 +5253,9 @@ recheck:
 		p->ss_exh_timer.function = ss_exh_cb;
 
 		/* initialize ss_repl_list */
-		p->ss_repl_list[0].amt = ns_to_ktime(0);
+		p->ss_repl_list[0].amt = p->sched_ss_init_budget;
 		p->ss_repl_list[0].time = hrtimer_cb_get_time(&p->ss_repl_timer);
-		p->repl_head = -1;
+		p->repl_head = 0;
 
 		/*
 		 * Set the start time of the first period.
