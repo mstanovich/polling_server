@@ -1042,15 +1042,12 @@ static void ss_budget_check(struct rq *rq, struct task_struct *p, ktime_t now, b
 {
 	ktime_t budget;
 
-	printk(KERN_ERR "%s\n", __func__);
-
 	budget = ss_curr_budget(p);
 
 	if (!running) {
 		/* p was previously running, but is no longer, no need for exh timer */
 		if (ktime_cmp(budget, ns_to_ktime(0)) < 0) {
 			/* out of budget */
-			printk(KERN_ERR "out of budget\n");
 			ss_change_prio(rq, p, ss_bg_prio(p), false);
 		}
 
@@ -1066,9 +1063,11 @@ static void ss_budget_check(struct rq *rq, struct task_struct *p, ktime_t now, b
 			printk(KERN_ERR "expiration time greater than replenishment (overloaded?)\n");
 		} else {
 			/* only set exhaust timer if it is < repl timer */
+			/* TODO: make sure repl timer is set! */
 			WARN_ON(hrtimer_start(&p->ss_exh_timer,
 				timer_exp, HRTIMER_MODE_ABS));
 		}
+		return;
 	}
 }
 
@@ -1091,12 +1090,10 @@ static void cs_notify_rt(struct rq *rq, struct task_struct *prev,
 
 	/* arm exhaust timer to minimize overrun */
 	if (next->policy == SCHED_SPORADIC) {
-		printk(KERN_ERR "next\n");
 		ss_budget_check(rq, next, now, true);
 	}
 
 	if (prev->policy == SCHED_SPORADIC) {
-		printk(KERN_ERR "prev\n");
 		ss_budget_check(rq, prev, now, false);
 	}
 }
@@ -1126,9 +1123,10 @@ enqueue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 		enqueue_pushable_task(rq, p);
 
 	if (p->policy == SCHED_SPORADIC) {
-		printk(KERN_ERR "enqueue\n");
-
-		/* forward the expiration time in interval(polling) increments */
+		/* TODO: probably not needed?  Set when dequeued? ss_budget_check()
+		 * relies on repl timer being set */
+		/* TODO: check for missed period */
+		/* forward the replenishment time in interval(polling) increments */
 		hrtimer_forward(&p->ss_repl_timer,
 			hrtimer_get_expires(&p->ss_repl_timer), p->sched_ss_repl_period);
 
@@ -1147,8 +1145,6 @@ static void dequeue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 	dequeue_pushable_task(rq, p);
 
 	if (p->policy == SCHED_SPORADIC) {
-		printk(KERN_ERR "dequeue\n");
-	
 		/*
 		 * exh timer should have been active if we are running in fg
 		 * Possibly we could have been dequeued but exhaust timer came before
