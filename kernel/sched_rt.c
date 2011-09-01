@@ -3,6 +3,11 @@
  * policies)
  */
 
+static inline ktime_t ss_get_now(struct task_struct *p)
+{
+	return hrtimer_cb_get_time(&p->ss_repl_timer);
+}
+
 static inline int ss_fg_prio(struct task_struct *p)
 {
 	return MAX_RT_PRIO-1 - p->rt_priority;
@@ -29,20 +34,139 @@ static inline bool ss_curr_prio_bg(struct task_struct *p)
 	return false;
 }
 
-static inline ktime_t ss_capacity(struct task_struct *p)
+/* Replenishment list functions */
+static bool ss_rl_empty(struct task_struct *p)
 {
-	return ktime_sub(p->sched_ss_init_budget, p->ss_usage);
+	return (p->repl_head == -1);
 }
 
-static inline bool ss_out_of_budget(struct task_struct *p)
+static bool ss_rl_full(struct task_struct *p)
 {
-	return ktime_cmp(ss_capacity(p), ns_to_ktime(0)) <= 0;
+	/* > should not be possible, means we exceeded max_repl */
+	return (p->repl_head+1 >= p->sched_ss_max_repl);
 }
 
-static inline ktime_t ss_get_now(struct task_struct *p)
+/**
+ * @return: number of replenishments currently in use.
+ */
+static int ss_rl_size(struct task_struct *p)
 {
-	return hrtimer_cb_get_time(&p->ss_repl_timer);
+	return (p->sched_ss_max_repl - (p->repl_head+1));
 }
+
+static struct sched_ss_repl ss_rl_pop(struct task_struct *p)
+{
+	BUG_ON(ss_rl_empty(p));
+
+	return p->ss_repl_list[p->repl_head--];
+}
+
+/*
+static void ss_rl_push(struct task_struct *p, struct sched_ss_repl repl)
+{
+	BUG_ON(ss_rl_full(p));
+
+	p->ss_repl_list[++p->repl_head] = repl;
+}
+
+static void ss_rl_replace_front(struct task_struct *p, struct sched_ss_repl repl)
+{
+	p->ss_repl_list[p->repl_head] = repl;
+}
+*/
+
+/**
+ * Assumes there is one space/slot available in the replenishment list.
+ */
+static void ss_rl_add(struct task_struct *p, struct sched_ss_repl repl)
+{
+	int i;
+
+	for (i=p->repl_head; i>=0; --i) {
+		p->ss_repl_list[i+1] = p->ss_repl_list[i];
+	}
+
+	p->ss_repl_list[0] = repl;
+}
+
+static bool ss_valid_rl(struct task_struct *p)
+{
+	/*
+	 * -1 (empty), but cannot ever be empty
+	 * >= p->sched_ss_max_repl-1 (full)
+	 */
+	if (p->repl_head < 0 || p->repl_head >= p->sched_ss_max_repl-1) {
+		return false;
+	}
+
+	/* TODO: validate capacity is not > sched_ss_init_budget
+	 * iterate through all replenishments
+	 * BUG_ON();
+	 */
+/*
+	int i;
+	for (i=p->repl_head; i>=0; --i) {
+		if (ktime_cmp(now, p->ss_repl_list[i].time) < 0) {
+			break;
+		}
+		capacity = ktime_add(capacity, p->ss_repl_list[i].amt);
+	}
+*/
+
+	return true;
+}
+
+/**
+ * Assumes p is scheduled using SCHED_SPORADIC policy.
+ */
+static inline ktime_t ss_capacity(struct task_struct *p, ktime_t now)
+{
+    BUG_ON(!ss_valid_rl(p));
+
+    return ktime_sub(p->ss_repl_list[p->repl_head].amt, p->ss_usage);
+}
+
+static inline bool ss_out_of_budget(struct task_struct *p, ktime_t now)
+{
+	return ktime_cmp(ss_capacity(p, now), ns_to_ktime(0)) <= 0;
+}
+
+static void
+prio_changed_rt(struct rq *rq, struct task_struct *p, int oldprio);
+
+static void ss_change_prio(struct rq *rq, struct task_struct *p,
+	int new_prio, bool blocked);
+
+/**
+ * Assumes rq->lock is held.
+ */
+static void ss_budget_check(struct rq *rq, struct task_struct *p, ktime_t now, bool blocked, bool set_repl_timer)
+{
+	assert_raw_spin_locked(&task_rq(p)->lock);
+
+	if (ss_out_of_budget(p, now)) {
+		ss_change_prio(rq, p, ss_bg_prio(p), blocked);
+	}
+}
+
+/**
+ * Assumes p is ready to run when called.
+ *
+ * @return:
+ * 	- p has capacity to run now.
+ */
+static bool ss_unblock_check(struct rq *rq, struct task_struct *p, ktime_t now, bool start_repl_timer)
+{
+		/* forward the replenishment time in interval(polling) increments */
+		hrtimer_forward(&p->ss_repl_timer,
+			hrtimer_get_expires(&p->ss_repl_timer), p->sched_ss_repl_period);
+
+		/* activate the timer */
+		hrtimer_restart(&p->ss_repl_timer);
+
+		return false;
+}
+
 
 #ifdef CONFIG_RT_GROUP_SCHED
 
@@ -982,10 +1106,16 @@ static void dequeue_rt_entity(struct sched_rt_entity *rt_se)
 	}
 }
 
-static void
-prio_changed_rt(struct rq *rq, struct task_struct *p, int oldprio);
 /**
- * Similar to __setscheduler().
+ * Similar to operations in __setscheduler().
+ * 
+ * Change the priority of a task.
+ *
+ * @blocked:
+ * 	- need to know if task is blocked, so we do not enqueue it and make it
+ * 	  incorrectly runnable
+ * 	- p->on_rq is a good indicator, but enqueue and dequeue only set these
+ * 	  after, so be careful when using on_rq in enqueue and dequeue
  *
  * TODO: would like to allow option for bg prio/not running/etc.
  *
@@ -996,6 +1126,10 @@ static void ss_change_prio(struct rq *rq, struct task_struct *p,
 {
 	unsigned long flags;
 	int oldprio = p->prio;
+
+	/* TODO: just sanity check */
+	if (blocked != (!p->on_rq))
+		printk(KERN_ERR "blocked != (!p->on_rq)\n");
 
 	if (!blocked) {
 		dequeue_rt_stack(&p->rt);
@@ -1043,33 +1177,39 @@ static void ss_change_prio(struct rq *rq, struct task_struct *p,
 	}
 }
 
-static void ss_budget_check(struct rq *rq, struct task_struct *p, ktime_t now, bool running)
+static void ss_do_exh_timer(struct rq *rq, struct task_struct *p, ktime_t now, bool running)
 {
-	ktime_t budget = ss_capacity(p);
+	ktime_t budget = ss_capacity(p, now);
 
 	if (!running) {
-		/* p was previously running, but is no longer, no need for exh timer */
-		if (ktime_cmp(budget, ns_to_ktime(0)) < 0) {
-			/* out of budget */
-			ss_change_prio(rq, p, ss_bg_prio(p), false);
-		}
+		/* p was previously running, but is no longer,
+		 * no need for exh timer */
+		WARN_ON_ONCE(hrtimer_try_to_cancel(&p->ss_exh_timer) == -1);
 
-		/* p is being removed from processor, do not need to stop it */
-		WARN_ON(hrtimer_try_to_cancel(&p->ss_exh_timer) == -1);
 		return;
 	}
 
 	if (running) {
 		ktime_t timer_exp = ktime_add(now, budget);
 
+		if (ss_out_of_budget(p, now)) {
+			printk(KERN_ERR "running task with no budget\n");
+		}
+
+		if (ktime_cmp(timer_exp, ss_get_now(p)) <= 0) {
+			printk(KERN_ERR "setting timer to expire in the past\n");
+		}
+
 		if (ktime_cmp(timer_exp, hrtimer_get_expires(&p->ss_repl_timer)) > 0) {
 			printk(KERN_ERR "expiration time greater than replenishment (overloaded?)\n");
 		} else {
 			/* only set exhaust timer if it is < repl timer */
 			/* TODO: make sure repl timer is set! */
-			WARN_ON(hrtimer_start(&p->ss_exh_timer,
+			WARN_ON_ONCE(hrtimer_start(&p->ss_exh_timer,
 				timer_exp, HRTIMER_MODE_ABS));
+
 		}
+
 		return;
 	}
 }
@@ -1086,11 +1226,15 @@ static void cs_notify_rt(struct rq *rq, struct task_struct *prev,
 {
 	/* arm exhaust timer to minimize overrun */
 	if (next->policy == SCHED_SPORADIC) {
-		ss_budget_check(rq, next, ss_get_now(next), true);
+		ss_do_exh_timer(rq, next, ss_get_now(next), true);
 	}
 
 	if (prev->policy == SCHED_SPORADIC) {
-		ss_budget_check(rq, prev, ss_get_now(prev), false);
+		ktime_t now = ss_get_now(prev);
+
+		/* TODO: prev->on_rq or false */
+		ss_budget_check(rq, prev, now, prev->on_rq, true);
+		ss_do_exh_timer(rq, prev, now, false);
 	}
 }
 
@@ -1106,12 +1250,6 @@ enqueue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 		rt_se->timeout = 0;
 
 	if (p->policy != SCHED_SPORADIC) {
-		/* 
-		 * if we are running at background prio, we may not want to enqueue p
-		 * until a replenishment (i.e. no execute background)
-		 */
-		/* TODO: no execute background option */
-		/* TODO: backport to previous commmit */
 		enqueue_rt_entity(rt_se, flags & ENQUEUE_HEAD);
 	}
 
@@ -1119,15 +1257,8 @@ enqueue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 		enqueue_pushable_task(rq, p);
 
 	if (p->policy == SCHED_SPORADIC) {
-		/* TODO: probably not needed?  Set when dequeued? ss_budget_check()
-		 * relies on repl timer being set */
-		/* TODO: check for missed period */
-		/* forward the replenishment time in interval(polling) increments */
-		hrtimer_forward(&p->ss_repl_timer,
-			hrtimer_get_expires(&p->ss_repl_timer), p->sched_ss_repl_period);
-
-		/* activate the timer */
-		hrtimer_restart(&p->ss_repl_timer);
+		/* will set repl timer, exh timer set in cs_notify */
+		ss_unblock_check(rq, p, ss_get_now(p), true);
 	}
 }
 
@@ -1147,14 +1278,14 @@ static void dequeue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 		 * rq->lock obtained on dequeue path through kernel
 		 */
 		/* TODO: only warn if in fg */
-		WARN_ON(!hrtimer_active(&p->ss_exh_timer));
+		WARN_ON_ONCE(!hrtimer_active(&p->ss_exh_timer));
 
  		/* can't use hrtimer_cancel here because we are holding rq->lock */
-		WARN_ON(hrtimer_try_to_cancel(&p->ss_exh_timer) == -1);
+		WARN_ON_ONCE(hrtimer_try_to_cancel(&p->ss_exh_timer) == -1);
 
 		/* replenishment timer should only be deactivated by a dequeue, so make
 		 * sure it is active before we cancel it */
-		WARN_ON(!hrtimer_active(&p->ss_repl_timer));
+		WARN_ON_ONCE(!hrtimer_active(&p->ss_repl_timer));
 
 		/* 
 		 * TODO: if repl_timer is not canceled, task_struct could go away
@@ -1162,7 +1293,7 @@ static void dequeue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 		 * expiration).  If we can't cancel it here better make sure it is
 		 * canceled before deallocation of task_struct
 		 */
-		WARN_ON(hrtimer_try_to_cancel(&p->ss_repl_timer) == -1);
+		WARN_ON_ONCE(hrtimer_try_to_cancel(&p->ss_repl_timer) == -1);
 	}
 }
 
@@ -1330,7 +1461,10 @@ static enum hrtimer_restart ss_repl_cb(struct hrtimer *timer)
 		WARN_ON(hrtimer_active(&p->ss_exh_timer));
 	}
 
-	hrtimer_try_to_cancel(&p->ss_exh_timer);
+	/* exh timer may be active if task was preempted for a long time */
+	if (hrtimer_try_to_cancel(&p->ss_exh_timer) != 0) {
+		printk(KERN_ERR "exh timer active in ss_repl_cb(), probably overloaded (full budget not received)\n");
+	}
 
 	/* replenishment arrived, set usage to zero */
 	p->ss_usage = ns_to_ktime(0);
@@ -1341,6 +1475,7 @@ static enum hrtimer_restart ss_repl_cb(struct hrtimer *timer)
 		hrtimer_get_expires(timer), p->sched_ss_repl_period);
 
 	/* handles skipped periods */
+	/* now is relative to start of previous period, prevents drift */
 	now = ktime_sub(hrtimer_get_expires(timer), p->sched_ss_repl_period);
 
 	if (ktime_cmp(now, ns_to_ktime(0)) == -1)
@@ -1358,9 +1493,9 @@ static enum hrtimer_restart ss_repl_cb(struct hrtimer *timer)
 		 * in so set exhaust timer
 		 */
 		if (task_running(rq, p))
-			ss_budget_check(rq, p, now, true);
+			ss_do_exh_timer(rq, p, now, true);
 	}
- 
+
 	raw_spin_unlock(&rq->lock);
 
 	/* TODO: we may have tried to cancel timer elsewhere, but failed since
@@ -1373,25 +1508,23 @@ static enum hrtimer_restart ss_exh_cb(struct hrtimer *timer)
 {
 	struct task_struct *p;
 	struct rq *rq;
-	bool blocked;
-
-	//printk(KERN_ERR "start %s\n", __func__);
+    ktime_t now;
 
 	p = container_of(timer, struct task_struct, ss_exh_timer);
 	rq = task_rq(p);
 	
 	raw_spin_lock(&rq->lock);
 
+	now = ss_get_now(p);
+
 	update_rq_clock(rq);
 	update_curr_rt(rq);
 
 	/* if p has budget, exh timer should not expire */
-	if (!ss_out_of_budget(p))
+	if (!ss_out_of_budget(p, now))
 		printk(KERN_ERR "exh timer expired with budget remaining\n");
 
-	blocked = !p->on_rq;
-
-	ss_change_prio(rq, p, ss_bg_prio(p), blocked);
+	ss_change_prio(rq, p, ss_bg_prio(p), !p->on_rq);
 
 	raw_spin_unlock(&rq->lock);
 
