@@ -29,14 +29,19 @@ static inline bool ss_curr_prio_bg(struct task_struct *p)
 	return false;
 }
 
-static inline ktime_t ss_curr_budget(struct task_struct *p)
+static inline ktime_t ss_capacity(struct task_struct *p)
 {
 	return ktime_sub(p->sched_ss_init_budget, p->ss_usage);
 }
 
 static inline bool ss_out_of_budget(struct task_struct *p)
 {
-	return ktime_cmp(ss_curr_budget(p), ns_to_ktime(0)) <= 0;
+	return ktime_cmp(ss_capacity(p), ns_to_ktime(0)) <= 0;
+}
+
+static inline ktime_t ss_get_now(struct task_struct *p)
+{
+	return hrtimer_cb_get_time(&p->ss_repl_timer);
 }
 
 #ifdef CONFIG_RT_GROUP_SCHED
@@ -1040,9 +1045,7 @@ static void ss_change_prio(struct rq *rq, struct task_struct *p,
 
 static void ss_budget_check(struct rq *rq, struct task_struct *p, ktime_t now, bool running)
 {
-	ktime_t budget;
-
-	budget = ss_curr_budget(p);
+	ktime_t budget = ss_capacity(p);
 
 	if (!running) {
 		/* p was previously running, but is no longer, no need for exh timer */
@@ -1081,20 +1084,13 @@ static void ss_budget_check(struct rq *rq, struct task_struct *p, ktime_t now, b
 static void cs_notify_rt(struct rq *rq, struct task_struct *prev,
               struct task_struct *next)
 {
-	ktime_t now;
-
-	if (next->policy == SCHED_SPORADIC)
-		now = hrtimer_cb_get_time(&next->ss_repl_timer);
-	else if (prev->policy == SCHED_SPORADIC)
-		now = hrtimer_cb_get_time(&prev->ss_repl_timer);
-
 	/* arm exhaust timer to minimize overrun */
 	if (next->policy == SCHED_SPORADIC) {
-		ss_budget_check(rq, next, now, true);
+		ss_budget_check(rq, next, ss_get_now(next), true);
 	}
 
 	if (prev->policy == SCHED_SPORADIC) {
-		ss_budget_check(rq, prev, now, false);
+		ss_budget_check(rq, prev, ss_get_now(prev), false);
 	}
 }
 
@@ -1317,8 +1313,6 @@ static enum hrtimer_restart ss_repl_cb(struct hrtimer *timer)
 	bool blocked;
 	int periods_passed;
 	ktime_t now;
-
-	//printk(KERN_ERR "start %s\n", __func__);
 
 	p = container_of(timer, struct task_struct, ss_repl_timer);
 	rq = task_rq(p);
