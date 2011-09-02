@@ -1126,12 +1126,15 @@ static void ss_change_prio(struct rq *rq, struct task_struct *p,
 {
 	unsigned long flags;
 	int oldprio = p->prio;
+	bool on_rq = !blocked;
 
 	/* TODO: just sanity check */
+	/*
 	if (blocked != (!p->on_rq))
 		printk(KERN_ERR "blocked != (!p->on_rq)\n");
+	*/
 
-	if (!blocked) {
+	if (on_rq) {
 		dequeue_rt_stack(&p->rt);
 	}
 	
@@ -1146,13 +1149,13 @@ static void ss_change_prio(struct rq *rq, struct task_struct *p,
 	 * Changing location in rt queue only should be done if we are currently
 	 * enqueued.
 	 */
-	if (!blocked) {
+	if (on_rq) {
 		struct sched_rt_entity *rt_se = &p->rt;
 
 		/* do not want to enqueue rt_se if it was not previously */
 		/* NOTE: rt_se will be NULL after for_each */
 		for_each_sched_rt_entity(rt_se) {
-				__enqueue_rt_entity(rt_se, true);
+			__enqueue_rt_entity(rt_se, true);
 		}
 		/* 
 		 * calls resched_task() if necessary.  Could possibly reschedule only
@@ -1163,9 +1166,9 @@ static void ss_change_prio(struct rq *rq, struct task_struct *p,
 	}
 
 	/* OPTION: do not execute in background */
-	if (!blocked && ss_curr_prio_bg(p)) {
+	if (on_rq && ss_curr_prio_bg(p)) {
 		/* remove from rq */
-		dequeue_rt_stack(&p->rt);
+		dequeue_rt_entity(&p->rt);
 		/* 
 		 * force reschedule if p is running, if p is not running, p cannot be
 		 * picked since p is removed from rq above, prio_changed_rt() will not
@@ -1250,9 +1253,7 @@ enqueue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 	if (flags & ENQUEUE_WAKEUP)
 		rt_se->timeout = 0;
 
-	if (p->policy != SCHED_SPORADIC) {
-		enqueue_rt_entity(rt_se, flags & ENQUEUE_HEAD);
-	}
+	enqueue_rt_entity(rt_se, flags & ENQUEUE_HEAD);
 
 	if (!task_current(rq, p) && p->rt.nr_cpus_allowed > 1)
 		enqueue_pushable_task(rq, p);
@@ -1260,6 +1261,10 @@ enqueue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 	if (p->policy == SCHED_SPORADIC) {
 		/* will set repl timer, exh timer set in cs_notify */
 		ss_unblock_check(rq, p, ss_get_now(p), true);
+
+		if (!ss_curr_prio_bg(p)) {
+			printk(KERN_ERR "enqueued but not at bg prio, but should be\n");
+		}
 	}
 }
 
@@ -1295,6 +1300,9 @@ static void dequeue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 		 * canceled before deallocation of task_struct
 		 */
 		WARN_ON_ONCE(hrtimer_try_to_cancel(&p->ss_repl_timer) == -1);
+
+		/* blocked=true since removed from rq with dequeue_rt_entity() */
+		ss_change_prio(rq, p, ss_bg_prio(p), true);
 	}
 }
 
@@ -1442,7 +1450,6 @@ static enum hrtimer_restart ss_repl_cb(struct hrtimer *timer)
 {
 	struct task_struct *p;
 	struct rq *rq;
-	bool blocked;
 	int periods_passed;
 	ktime_t now;
 
@@ -1459,8 +1466,11 @@ static enum hrtimer_restart ss_repl_cb(struct hrtimer *timer)
 	/* exh timer may be active if task was preempted for a long time */
 	if (ktime_cmp(p->ss_usage, p->sched_ss_init_budget) > 0) {
 		ktime_t budget = ktime_sub(p->sched_ss_init_budget, p->ss_usage);
-		
-		printk(KERN_ERR "budget overrun: %lld\n", budget.tv64);
+
+		/* 3000 is just a fudge factor */
+		if (budget.tv64 < -3000) {
+			printk(KERN_ERR "budget overrun: %lld\n", budget.tv64);
+		}
 		WARN_ON(hrtimer_active(&p->ss_exh_timer));
 	}
 
@@ -1471,8 +1481,6 @@ static enum hrtimer_restart ss_repl_cb(struct hrtimer *timer)
 
 	/* replenishment arrived, set usage to zero */
 	p->ss_usage = ns_to_ktime(0);
-
-	blocked = !p->on_rq;
 
 	periods_passed = hrtimer_forward(timer,
 		hrtimer_get_expires(timer), p->sched_ss_repl_period);
@@ -1487,18 +1495,18 @@ static enum hrtimer_restart ss_repl_cb(struct hrtimer *timer)
 	if (periods_passed != 1)
 		printk(KERN_ERR "SCHED_SPORADIC: replenishment timer skipped a period\n");
 
-	if (!blocked) {
-		/* exhaust timer will be set when task is context switched to run */
-		ss_change_prio(rq, p, ss_fg_prio(p), blocked);
+	/* even if taken of rt runqueue, on_rq will be 1 and ss_change_prio will
+	 * return p to the rt runqueue */
+	/* exhaust timer will be set when task is context switched to run */
+	ss_change_prio(rq, p, ss_fg_prio(p), !p->on_rq);
 
-		/* 
-		 * HOWEVER, if we are already running, we will not be context switched
-		 * in so set exhaust timer
-		 */
-		if (task_running(rq, p))
-			ss_do_exh_timer(rq, p, now, true);
-	}
-
+	/* 
+	 * HOWEVER, if we are already running, we will not be context switched
+	 * in so set exhaust timer
+	 */
+	if (task_running(rq, p))
+		ss_do_exh_timer(rq, p, now, true);
+	
 	raw_spin_unlock(&rq->lock);
 
 	/* TODO: we may have tried to cancel timer elsewhere, but failed since
@@ -1524,8 +1532,9 @@ static enum hrtimer_restart ss_exh_cb(struct hrtimer *timer)
 	update_curr_rt(rq);
 
 	/* if p has budget, exh timer should not expire */
-	if (!ss_out_of_budget(p, now))
-		printk(KERN_ERR "exh timer expired with budget remaining\n");
+	if (!ss_out_of_budget(p, now)) {
+		printk(KERN_ERR "exh timer expired with budget remaining: %lld\n", (ss_capacity(p, now)).tv64);
+	}
 
 	ss_change_prio(rq, p, ss_bg_prio(p), !p->on_rq);
 
