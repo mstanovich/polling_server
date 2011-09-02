@@ -1469,7 +1469,7 @@ static enum hrtimer_restart ss_repl_cb(struct hrtimer *timer)
 
 		/* 3000 is just a fudge factor */
 		if (budget.tv64 < -3000) {
-			printk(KERN_ERR "budget overrun: %lld\n", budget.tv64);
+			printk(KERN_ERR "budget overrun: %lld\n", (u64)budget.tv64);
 		}
 		WARN_ON(hrtimer_active(&p->ss_exh_timer));
 	}
@@ -1533,7 +1533,11 @@ static enum hrtimer_restart ss_exh_cb(struct hrtimer *timer)
 
 	/* if p has budget, exh timer should not expire */
 	if (!ss_out_of_budget(p, now)) {
-		printk(KERN_ERR "exh timer expired with budget remaining: %lld\n", (ss_capacity(p, now)).tv64);
+		ktime_t budget = ktime_sub(p->sched_ss_init_budget, p->ss_usage);
+
+		if (budget.tv64 < -3000) {
+			printk(KERN_ERR "exh timer expired with budget remaining: %lld\n", (u64)budget.tv64);
+		}
 	}
 
 	ss_change_prio(rq, p, ss_bg_prio(p), !p->on_rq);
