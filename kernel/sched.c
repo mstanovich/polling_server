@@ -5233,12 +5233,17 @@ recheck:
 
 	/* Initialization of SCHED_SPORADIC task parameters */
 	if (policy == SCHED_SPORADIC) {
-		/* when first starting, rt_priority will be the fg priority, which is
-		 * is set above through __setscheduler(). */
 		ktime_t now;
 
-		/* set scheduling parameters */
-		p->rt_priority = param->sched_priority;
+		/* when first starting, rt_priority will be the fg priority, which is
+		 * is set above through __setscheduler(). */
+
+		/* for polling server start with bg prio and increase to fg when repl
+		 * arrives */
+		p->normal_prio = MAX_RT_PRIO-1 - param->sched_ss_low_priority;
+		/* we are holding p->pi_lock already */
+		p->prio = rt_mutex_getprio(p);
+
 		/* put priority into kernel's representation */
 		p->sched_ss_low_priority = MAX_RT_PRIO-1 - param->sched_ss_low_priority;
 		p->sched_ss_repl_period = timespec_to_ktime(param->sched_ss_repl_period);
@@ -5256,6 +5261,8 @@ recheck:
 		p->ss_repl_list[0].amt = p->sched_ss_init_budget;
 		p->ss_repl_list[0].time = hrtimer_cb_get_time(&p->ss_repl_timer);
 		p->repl_head = 0;
+
+		p->ss_usage = ns_to_ktime(0);
 
 		/*
 		 * Set the start time of the first period.

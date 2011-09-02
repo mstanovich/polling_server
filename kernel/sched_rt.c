@@ -1159,6 +1159,7 @@ static void ss_change_prio(struct rq *rq, struct task_struct *p,
 		 * if p is runnable.
 		 */
 		prio_changed_rt(rq, p, oldprio);
+		resched_task(rq->curr);
 	}
 
 	/* OPTION: do not execute in background */
@@ -1444,6 +1445,8 @@ static enum hrtimer_restart ss_repl_cb(struct hrtimer *timer)
 	bool blocked;
 	int periods_passed;
 	ktime_t now;
+
+	//printk(KERN_ERR "%s\n", __func__);
 
 	p = container_of(timer, struct task_struct, ss_repl_timer);
 	rq = task_rq(p);
