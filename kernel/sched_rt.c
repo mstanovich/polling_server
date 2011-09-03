@@ -87,6 +87,8 @@ static void ss_rl_add(struct task_struct *p, struct sched_ss_repl repl)
 	}
 
 	p->ss_repl_list[0] = repl;
+
+	p->repl_head++;
 }
 
 static bool ss_valid_rl(struct task_struct *p)
@@ -137,10 +139,15 @@ prio_changed_rt(struct rq *rq, struct task_struct *p, int oldprio);
 static void ss_change_prio(struct rq *rq, struct task_struct *p,
 	int new_prio, bool blocked);
 
+static void ss_split_check(struct task_struct *p, ktime_t now)
+{
+	p->ss_usage = ns_to_ktime(0);
+}
+
 /**
  * Assumes rq->lock is held.
  */
-static void ss_budget_check(struct rq *rq, struct task_struct *p, ktime_t now, bool blocked, bool set_repl_timer)
+static void ss_budget_check(struct rq *rq, struct task_struct *p, ktime_t now, bool blocked, bool running, bool set_repl_timer)
 {
 	assert_raw_spin_locked(&task_rq(p)->lock);
 
@@ -155,7 +162,7 @@ static void ss_budget_check(struct rq *rq, struct task_struct *p, ktime_t now, b
  * @return:
  * 	- p has capacity to run now.
  */
-static bool ss_unblock_check(struct rq *rq, struct task_struct *p, ktime_t now, bool start_repl_timer)
+static bool ss_unblock_check(struct rq *rq, struct task_struct *p, ktime_t now, bool start_repl_timer, bool running)
 {
 		/* forward the replenishment time in interval(polling) increments */
 		hrtimer_forward(&p->ss_repl_timer,
@@ -1181,6 +1188,13 @@ static void ss_change_prio(struct rq *rq, struct task_struct *p,
 	}
 }
 
+/**
+ * Handle setting and canceling the exhaust timer.
+ *
+ * @running:
+ * 	- TODO: probably should be named set_timer
+ * 	- sets/cancels timer based if true/false
+ */
 static void ss_do_exh_timer(struct rq *rq, struct task_struct *p, ktime_t now, bool running)
 {
 	ktime_t budget = ss_capacity(p, now);
@@ -1201,7 +1215,7 @@ static void ss_do_exh_timer(struct rq *rq, struct task_struct *p, ktime_t now, b
 		}
 
 		if (ktime_cmp(timer_exp, ss_get_now(p)) <= 0) {
-			printk(KERN_ERR "setting timer to expire in the past\n");
+			printk(KERN_ERR "setting exhaust timer to expire in the past\n");
 		}
 
 		if (ktime_cmp(timer_exp, hrtimer_get_expires(&p->ss_repl_timer)) > 0) {
@@ -1237,7 +1251,7 @@ static void cs_notify_rt(struct rq *rq, struct task_struct *prev,
 		ktime_t now = ss_get_now(prev);
 
 		/* TODO: prev->on_rq or false */
-		ss_budget_check(rq, prev, now, prev->on_rq, true);
+		ss_budget_check(rq, prev, now, prev->on_rq, false, true);
 		ss_do_exh_timer(rq, prev, now, false);
 	}
 }
@@ -1259,8 +1273,10 @@ enqueue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 		enqueue_pushable_task(rq, p);
 
 	if (p->policy == SCHED_SPORADIC) {
+		bool running = task_running(rq, p);
+
 		/* will set repl timer, exh timer set in cs_notify */
-		ss_unblock_check(rq, p, ss_get_now(p), true);
+		ss_unblock_check(rq, p, ss_get_now(p), true, running);
 
 		if (!ss_curr_prio_bg(p)) {
 			printk(KERN_ERR "enqueued but not at bg prio, but should be\n");
@@ -1278,6 +1294,8 @@ static void dequeue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 	dequeue_pushable_task(rq, p);
 
 	if (p->policy == SCHED_SPORADIC) {
+		ktime_t now = ss_get_now(p);
+
 		/*
 		 * exh timer should have been active if we are running in fg
 		 * Possibly we could have been dequeued but exhaust timer came before
@@ -1452,6 +1470,7 @@ static enum hrtimer_restart ss_repl_cb(struct hrtimer *timer)
 	struct rq *rq;
 	int periods_passed;
 	ktime_t now;
+	bool running;
 
 	//printk(KERN_ERR "%s\n", __func__);
 
@@ -1462,6 +1481,8 @@ static enum hrtimer_restart ss_repl_cb(struct hrtimer *timer)
 
 	update_rq_clock(rq);
 	update_curr_rt(rq);
+
+	running = task_running(rq, p);
 
 	/* exh timer may be active if task was preempted for a long time */
 	if (ktime_cmp(p->ss_usage, p->sched_ss_init_budget) > 0) {
@@ -1504,8 +1525,9 @@ static enum hrtimer_restart ss_repl_cb(struct hrtimer *timer)
 	 * HOWEVER, if we are already running, we will not be context switched
 	 * in so set exhaust timer
 	 */
-	if (task_running(rq, p))
-		ss_do_exh_timer(rq, p, now, true);
+
+	if (running)
+		ss_do_exh_timer(rq, p, now, running);
 	
 	raw_spin_unlock(&rq->lock);
 
