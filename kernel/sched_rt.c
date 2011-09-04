@@ -137,7 +137,7 @@ static void
 prio_changed_rt(struct rq *rq, struct task_struct *p, int oldprio);
 
 static void ss_change_prio(struct rq *rq, struct task_struct *p,
-	int new_prio, bool blocked);
+	int new_prio);
 
 static void ss_split_check(struct task_struct *p, ktime_t now)
 {
@@ -152,7 +152,7 @@ static void ss_budget_check(struct rq *rq, struct task_struct *p, ktime_t now, b
 	assert_raw_spin_locked(&task_rq(p)->lock);
 
 	if (ss_out_of_budget(p, now)) {
-		ss_change_prio(rq, p, ss_bg_prio(p), blocked);
+		ss_change_prio(rq, p, ss_bg_prio(p));
 	}
 }
 
@@ -1129,17 +1129,11 @@ static void dequeue_rt_entity(struct sched_rt_entity *rt_se)
  * NOTE: will not remove task from rq
  */
 static void ss_change_prio(struct rq *rq, struct task_struct *p,
-	int new_prio, bool blocked)
+	int new_prio)
 {
 	unsigned long flags;
 	int oldprio = p->prio;
-	bool on_rq = !blocked;
-
-	/* TODO: just sanity check */
-	/*
-	if (blocked != (!p->on_rq))
-		printk(KERN_ERR "blocked != (!p->on_rq)\n");
-	*/
+	bool on_rq = p->on_rq;
 
 	if (on_rq) {
 		dequeue_rt_stack(&p->rt);
@@ -1250,8 +1244,8 @@ static void cs_notify_rt(struct rq *rq, struct task_struct *prev,
 	if (prev->policy == SCHED_SPORADIC) {
 		ktime_t now = ss_get_now(prev);
 
-		/* TODO: prev->on_rq or false */
-		ss_budget_check(rq, prev, now, prev->on_rq, false, true);
+		/* TODO: !prev->on_rq or false */
+		ss_budget_check(rq, prev, now, !prev->on_rq, false, true);
 		ss_do_exh_timer(rq, prev, now, false);
 	}
 }
@@ -1262,15 +1256,7 @@ static void cs_notify_rt(struct rq *rq, struct task_struct *prev,
 static void
 enqueue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 {
-	struct sched_rt_entity *rt_se = &p->rt;
-
-	if (flags & ENQUEUE_WAKEUP)
-		rt_se->timeout = 0;
-
-	enqueue_rt_entity(rt_se, flags & ENQUEUE_HEAD);
-
-	if (!task_current(rq, p) && p->rt.nr_cpus_allowed > 1)
-		enqueue_pushable_task(rq, p);
+	struct sched_rt_entity *rt_se;
 
 	if (p->policy == SCHED_SPORADIC) {
 		bool running = task_running(rq, p);
@@ -1282,17 +1268,28 @@ enqueue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 			printk(KERN_ERR "enqueued but not at bg prio, but should be\n");
 		}
 	}
+
+	rt_se = &p->rt;
+
+	if (flags & ENQUEUE_WAKEUP)
+		rt_se->timeout = 0;
+
+	enqueue_rt_entity(rt_se, flags & ENQUEUE_HEAD);
+
+	if (!task_current(rq, p) && p->rt.nr_cpus_allowed > 1)
+		enqueue_pushable_task(rq, p);
+
 }
 
 static void dequeue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 {
-	struct sched_rt_entity *rt_se = &p->rt;
+	struct sched_rt_entity *rt_se;
 
-	update_curr_rt(rq);
-	dequeue_rt_entity(rt_se);
-
-	dequeue_pushable_task(rq, p);
-
+	/* 
+	 * place here so p->on_rq is consistent, that is before we actually
+	 * dequeue, so any functions called can use p->on_rq and it will be
+	 * accurate.  p->on_rq will be set after this function.
+	 */
 	if (p->policy == SCHED_SPORADIC) {
 		ktime_t now = ss_get_now(p);
 
@@ -1301,7 +1298,7 @@ static void dequeue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 		 * Possibly we could have been dequeued but exhaust timer came before
 		 * rq->lock obtained on dequeue path through kernel
 		 */
-		/* TODO: only warn if in fg */
+		/* TODO: only warn if in fg, and we allow bg execution */
 		WARN_ON_ONCE(!hrtimer_active(&p->ss_exh_timer));
 
  		/* can't use hrtimer_cancel here because we are holding rq->lock */
@@ -1319,9 +1316,15 @@ static void dequeue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 		 */
 		WARN_ON_ONCE(hrtimer_try_to_cancel(&p->ss_repl_timer) == -1);
 
-		/* blocked=true since removed from rq with dequeue_rt_entity() */
-		ss_change_prio(rq, p, ss_bg_prio(p), true);
+		ss_change_prio(rq, p, ss_bg_prio(p));
 	}
+
+	rt_se = &p->rt;
+
+	update_curr_rt(rq);
+	dequeue_rt_entity(rt_se);
+
+	dequeue_pushable_task(rq, p);
 }
 
 /*
@@ -1488,8 +1491,8 @@ static enum hrtimer_restart ss_repl_cb(struct hrtimer *timer)
 	if (ktime_cmp(p->ss_usage, p->sched_ss_init_budget) > 0) {
 		ktime_t budget = ktime_sub(p->sched_ss_init_budget, p->ss_usage);
 
-		/* 3000 is just a fudge factor */
-		if (budget.tv64 < -3000) {
+		/* -5000 is just a fudge factor */
+		if (budget.tv64 < -5000) {
 			printk(KERN_ERR "budget overrun: %lld\n", (u64)budget.tv64);
 		}
 		WARN_ON(hrtimer_active(&p->ss_exh_timer));
@@ -1519,7 +1522,7 @@ static enum hrtimer_restart ss_repl_cb(struct hrtimer *timer)
 	/* even if taken of rt runqueue, on_rq will be 1 and ss_change_prio will
 	 * return p to the rt runqueue */
 	/* exhaust timer will be set when task is context switched to run */
-	ss_change_prio(rq, p, ss_fg_prio(p), !p->on_rq);
+	ss_change_prio(rq, p, ss_fg_prio(p));
 
 	/* 
 	 * HOWEVER, if we are already running, we will not be context switched
@@ -1562,7 +1565,7 @@ static enum hrtimer_restart ss_exh_cb(struct hrtimer *timer)
 		}
 	}
 
-	ss_change_prio(rq, p, ss_bg_prio(p), !p->on_rq);
+	ss_change_prio(rq, p, ss_bg_prio(p));
 
 	raw_spin_unlock(&rq->lock);
 
