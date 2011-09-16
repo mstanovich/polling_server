@@ -156,6 +156,26 @@ static void ss_budget_check(struct rq *rq, struct task_struct *p, ktime_t now, b
 	}
 }
 
+/* forward the replenishment time in interval(polling) increments */
+static int ss_fwd_repl_timer(struct task_struct *p, ktime_t now)
+{
+	int periods = 0;
+	struct hrtimer *timer = &p->ss_repl_timer;
+	ktime_t interval = p->sched_ss_repl_period;
+
+	if (ktime_cmp(hrtimer_get_expires(timer), now) > 0) {
+		/* timer already set to beginning of next period */
+		return 0;
+	}
+
+	do {
+		periods++;
+		hrtimer_add_expires(timer, interval);
+	} while(ktime_cmp(hrtimer_get_expires(timer), now) <= 0);
+
+	return periods;
+}
+
 /**
  * Assumes p is ready to run when called.
  *
@@ -164,9 +184,7 @@ static void ss_budget_check(struct rq *rq, struct task_struct *p, ktime_t now, b
  */
 static bool ss_unblock_check(struct rq *rq, struct task_struct *p, ktime_t now, bool start_repl_timer, bool running)
 {
-		/* forward the replenishment time in interval(polling) increments */
-		hrtimer_forward(&p->ss_repl_timer,
-			hrtimer_get_expires(&p->ss_repl_timer), p->sched_ss_repl_period);
+		ss_fwd_repl_timer(p, now);
 
 		/* activate the timer */
 		hrtimer_restart(&p->ss_repl_timer);
@@ -1135,6 +1153,11 @@ static void ss_change_prio(struct rq *rq, struct task_struct *p,
 	int oldprio = p->prio;
 	bool on_rq = p->on_rq;
 
+	if (p->normal_prio == new_prio) {
+		//printk(KERN_ERR "trying to set prio to the same value\n");
+		return;
+	}
+
 	if (on_rq) {
 		dequeue_rt_stack(&p->rt);
 	}
@@ -1506,8 +1529,7 @@ static enum hrtimer_restart ss_repl_cb(struct hrtimer *timer)
 	/* replenishment arrived, set usage to zero */
 	p->ss_usage = ns_to_ktime(0);
 
-	periods_passed = hrtimer_forward(timer,
-		hrtimer_get_expires(timer), p->sched_ss_repl_period);
+	periods_passed = ss_fwd_repl_timer(p, hrtimer_get_expires(timer));
 
 	/* handles skipped periods */
 	/* now is relative to start of previous period, prevents drift */
