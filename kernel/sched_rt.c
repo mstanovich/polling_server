@@ -97,7 +97,7 @@ static bool ss_valid_rl(struct task_struct *p)
 	 * -1 (empty), but cannot ever be empty
 	 * >= p->sched_ss_max_repl-1 (full)
 	 */
-	if (p->repl_head < 0 || p->repl_head >= p->sched_ss_max_repl-1) {
+	if (p->repl_head < 0 || p->repl_head >= p->sched_ss_max_repl) {
 		return false;
 	}
 
