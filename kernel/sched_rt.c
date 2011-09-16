@@ -1158,6 +1158,11 @@ static void ss_change_prio(struct rq *rq, struct task_struct *p,
 		return;
 	}
 
+	if (p->normal_prio == new_prio) {
+		//printk(KERN_ERR "trying to set prio to the same value\n");
+		return;
+	}
+
 	if (on_rq) {
 		dequeue_rt_stack(&p->rt);
 	}
@@ -1238,11 +1243,12 @@ static void ss_do_exh_timer(struct rq *rq, struct task_struct *p, ktime_t now, b
 		if (ktime_cmp(timer_exp, hrtimer_get_expires(&p->ss_repl_timer)) > 0) {
 			printk(KERN_ERR "expiration time greater than replenishment (overloaded?)\n");
 		} else {
-			/* only set exhaust timer if it is < repl timer */
-			/* TODO: make sure repl timer is set! */
-			WARN_ON_ONCE(hrtimer_start(&p->ss_exh_timer,
-				timer_exp, HRTIMER_MODE_ABS));
-
+			if (!ss_curr_prio_bg(p)) {
+				/* only set exhaust timer if it is < repl timer */
+				/* TODO: make sure repl timer is set! */
+				WARN_ON_ONCE(hrtimer_start(&p->ss_exh_timer,
+					timer_exp, HRTIMER_MODE_ABS));
+			}
 		}
 
 		return;
@@ -1284,7 +1290,7 @@ enqueue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 	if (p->policy == SCHED_SPORADIC) {
 		bool running = task_running(rq, p);
 
-		/* will set repl timer, exh timer set in cs_notify */
+		/* sets repl timer, exh timer set in cs_notify */
 		ss_unblock_check(rq, p, ss_get_now(p), true, running);
 
 		if (!ss_curr_prio_bg(p)) {
@@ -1340,6 +1346,9 @@ static void dequeue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 		WARN_ON_ONCE(hrtimer_try_to_cancel(&p->ss_repl_timer) == -1);
 
 		ss_change_prio(rq, p, ss_bg_prio(p));
+
+		/* expire budget */
+		p->ss_usage = p->ss_repl_list[p->repl_head].amt;
 	}
 
 	rt_se = &p->rt;
